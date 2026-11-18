@@ -14,3 +14,4 @@ vnet-device_S.h
 vnetNotifyServer.c
 vnet-notify_S.h
 virtio-net
+vnet-client
