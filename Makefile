@@ -2,8 +2,9 @@
 # GNU/Hurd.
 #
 # Built against the x86_64-gnu cross prefix by the hurdkit toolchain
-# (`make -C toolchain virtio-9p` passes CC, CPATH and LIBS); for a manual
-# host-local build set CC/CPATH/LIBS the same way.
+# (`make -C toolchain virtio-9p` passes at least CC, CPATH and LIBS); for
+# a manual host-local build set them the same way, plus HURD_PREFIX and
+# HURD_SRC (below) when their defaults don't fit.
 
 CC ?= cc
 CFLAGS ?= -O2 -g -Wall
@@ -45,7 +46,10 @@ OBJSNET = virtio-net.o virtio-net-dev.o virtio-net-buf.o virtio-net-hurd.o \
 # The device stubs come from the cross prefix's gnumach headers, so the
 # wire contract is exactly what the guest kernel's device.defs says.
 HURD_PREFIX ?= $(HOME)/opt/x86_64-gnu
-HURD_SRC ?= $(HOME)/src/hurdkit-2/3p/hurd
+# The pinned Hurd source tree, for the libports MIG headers and libbpf.
+# The default assumes this repo is cloned next to hurdkit, whose
+# `make fetch-3p` checks the tree out into hurdkit/3p/hurd.
+HURD_SRC ?= $(abspath ../hurdkit/3p/hurd)
 MIG ?= mig
 # The defs preprocessing pass runs the host cpp directly: the cross
 # compiler would treat the unknown `.defs' extension as a linker input
@@ -147,6 +151,22 @@ vnetDeviceServer.o vnetNotifyServer.o virtio-net-serve.o: \
     virtio-net-serve.h
 virtio-net-serve.o: vnet-device_S.h vnet-notify_S.h
 
+# Every object that reads the Hurd source tree checks for it first, so
+# a wrong HURD_SRC fails with a message that names the variable instead
+# of a missing-header error from a generated MIG stub.
+HURD_SRC_OBJS = deviceServer.o notifyServer.o virtio-blk-serve.o \
+    virtio-serve.o vnetDeviceServer.o vnetNotifyServer.o virtio-net.o \
+    virtio-net-dev.o virtio-net-buf.o virtio-net-hurd.o virtio-net-serve.o \
+    bpf_impl.o queue.o
+$(HURD_SRC_OBJS): | check-hurd-src
+check-hurd-src:
+	@test -f '$(HURD_SRC)/libports/mig-decls.h' || { \
+	    echo "virtio: HURD_SRC=$(HURD_SRC) is not a Hurd source tree" \
+	        "(no libports/mig-decls.h)." >&2; \
+	    echo "virtio: set HURD_SRC to the pinned tree, e.g." \
+	        "make HURD_SRC=/path/to/hurdkit/3p/hurd" >&2; \
+	    exit 1; }
+
 # libbpf compiled from the pinned Hurd tree into local objects, so the
 # shared 3p checkout is not polluted with build products.
 bpf_impl.o: $(HURD_SRC)/libbpf/bpf_impl.c
@@ -174,4 +194,4 @@ clean:
 	    vnet-device_S.h vnet-notify.sdefsi* vnetNotifyServer.c \
 	    vnet-notify_S.h
 
-.PHONY: clean all
+.PHONY: clean all check-hurd-src

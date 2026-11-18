@@ -60,7 +60,15 @@ daemon needs the privileges behind `get_privileged_ports` (it runs
 
 Build with the x86_64-gnu cross toolchain. The Hurd toolchain harness at
 https://github.com/hurdkit/hurdkit/ has a `virtio-9p` target that sets
-CC/CPATH/LIBS; for a manual build, set them the same way.
+CC/CPATH/LIBS; for a manual build, set them the same way. Two more
+variables locate the toolchain and the Hurd sources:
+
+- `HURD_PREFIX` is the cross toolchain's install prefix (default
+  `~/opt/x86_64-gnu`). The MIG stubs are generated from its `device.defs`
+  and `notify.defs`.
+- `HURD_SRC` is the pinned Hurd source tree, for the libports MIG headers
+  and libbpf (default `../hurdkit/3p/hurd`, for a clone next to hurdkit,
+  whose `make fetch-3p` checks it out).
 
 ```
 make                     # builds virtio-9p, virtio-balloon, virtio-blk,
