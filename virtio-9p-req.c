@@ -3,10 +3,11 @@
    This file stays a framing layer, not a protocol interpreter: it checks
    the 4-byte little-endian size prefix, owns the TX/RX DMA buffers
    through the queue module, posts requests and collects their
-   completions into the reply queue the stream adapter reads.  It also
-   runs the one hand-built exchange, a Tversion, that proves the device,
-   the feature negotiation, the queue and the DMA addresses all work
-   before the stream adapter exists.  */
+   completions into the reply queue the stream adapter reads.  The one
+   field it reads is the msize of a Tversion, which it lowers to what the
+   buffers carry.  It also runs the hand-built exchanges of the selftest,
+   which prove the device, the feature negotiation, the queue and the DMA
+   addresses all work before a client opens the node.  */
 
 #include <errno.h>
 #include <pthread.h>
@@ -241,7 +242,7 @@ collect_used (void)
       /* Every reply carries at least the 7-byte header.  A shorter one
          is a device fault, and it must not reach the reader: zero bytes
          read is how the client sees end of stream.  */
-      if (used.len < 7 || used.len > V9P_RX_BUF_SIZE)
+      if (used.len < sizeof (struct v9p_hdr) || used.len > V9P_RX_BUF_SIZE)
         {
           fprintf (stderr, "virtio-9p: reply length %u outside 7..%u\n",
                    used.len, V9P_RX_BUF_SIZE);
@@ -289,7 +290,7 @@ v9p_submit (const void *pdu, uint32_t pdu_len)
   uint16_t head;
   error_t err;
 
-  if (pdu_len < 7 || pdu_len > V9P_TX_BUF_SIZE)
+  if (pdu_len < sizeof (struct v9p_hdr) || pdu_len > V9P_TX_BUF_SIZE)
     return EMSGSIZE;
 
   pthread_mutex_lock (&pool_lock);
@@ -467,25 +468,46 @@ v9p_collect_start (void)
   return 0;
 }
 
-/* One synchronous request: the complete outbound PDU in TX, reply
-   capacity in RX.  The reply lands in REPLY, at most REPLY_CAP bytes,
-   and its length in REPLY_LEN.  Only valid while no other request is in
-   flight, since it takes the oldest queued reply: that holds for the
-   selftest, which runs before the stream adapter accepts a client.  */
-error_t
-v9p_exchange (const void *pdu, uint32_t pdu_len,
-              void *reply, uint32_t reply_cap, uint32_t *reply_len)
+/* Lower the msize of a Tversion, in every dialect, to V9P_MSIZE_MAX.
+   9pfs asks for 16 MiB and takes whatever Rversion carries, then sizes
+   every Tread, Twrite and Treaddir to it, and the device sizes its own
+   replies and its iounit to it as well.  A Tread for more than an RX
+   buffer holds is then lost: QEMU finds the reply cannot fit the chain
+   and marks the device broken.  The device answers with what is asked,
+   so the request is lowered before the device sees it: client and
+   device then agree on a size the buffers carry.  Lowering only the
+   answer would leave the device free to build a reply, a large Treaddir
+   for one, that no buffer holds.  */
+void
+v9p_clamp_tversion (uint8_t *pdu, uint32_t pdu_len)
+{
+  struct v9p_tversion *tv = (struct v9p_tversion *) pdu;
+  uint32_t msize;
+
+  if (pdu_len < sizeof (struct v9p_tversion) || tv->hdr.type != V9P_TVERSION)
+    return;
+
+  msize = get_le32 (&tv->msize);
+  if (msize > V9P_MSIZE_MAX)
+    {
+      /* Every client that opens the node sends a Tversion, so this
+         recurs.  Under --verbose only.  */
+      if (v9p_verbose)
+        fprintf (stderr, "virtio-9p: Tversion msize %u lowered to %u\n",
+                 msize, V9P_MSIZE_MAX);
+      put_le32 (&tv->msize, V9P_MSIZE_MAX);
+    }
+}
+
+/* Collect the oldest queued reply into REPLY, at most REPLY_CAP bytes,
+   until its size prefix says it is whole.  Its length lands in
+   REPLY_LEN.  */
+static error_t
+read_reply (void *reply, uint32_t reply_cap, uint32_t *reply_len)
 {
   size_t got = 0, n;
   uint32_t size;
   error_t err;
-
-  if (reply_cap > V9P_RX_BUF_SIZE)
-    return EMSGSIZE;
-
-  err = v9p_submit (pdu, pdu_len);
-  if (err)
-    return err;
 
   for (got = 0; got < 4 || get_le32 (reply) > got; got += n)
     {
@@ -511,23 +533,98 @@ v9p_exchange (const void *pdu, uint32_t pdu_len,
   return 0;
 }
 
-/* Hand-built Tversion: size[4] type=100[1] tag[2] msize[4] version[2+8].
-   9pfs asks for 16 MiB; QEMU answers with its transport cap.  */
+/* One synchronous request: the complete outbound PDU in TX, reply
+   capacity in RX.  The reply lands in REPLY, at most REPLY_CAP bytes,
+   and its length in REPLY_LEN.  Only valid while no other request is in
+   flight, since it takes the oldest queued reply: that holds for the
+   selftest, which runs before the stream adapter accepts a client.  */
+error_t
+v9p_exchange (const void *pdu, uint32_t pdu_len,
+              void *reply, uint32_t reply_cap, uint32_t *reply_len)
+{
+  error_t err;
+
+  if (reply_cap > V9P_RX_BUF_SIZE)
+    return EMSGSIZE;
+
+  err = v9p_submit (pdu, pdu_len);
+  if (err)
+    return err;
+
+  return read_reply (reply, reply_cap, reply_len);
+}
+
+/* The same exchange through the stream adapter, the path 9pfs uses: the
+   request goes in as one write and the reply comes out of the read
+   side.  */
+static error_t
+adapter_exchange (const void *pdu, uint32_t pdu_len,
+                  void *reply, uint32_t reply_cap, uint32_t *reply_len)
+{
+  if (v9p_ios_write (pdu, pdu_len) < 0)
+    return errno;
+  return read_reply (reply, reply_cap, reply_len);
+}
+
+/* A Tversion for 9P2000.L asking for 16 MiB, as 9pfs does.  Returns its
+   length.  */
+static uint32_t
+put_tversion (uint8_t *pdu)
+{
+  struct v9p_version *tv = (struct v9p_version *) pdu;
+  uint32_t pdu_len = sizeof (struct v9p_version) + 8;
+
+  put_le32 (&tv->hdr.size, pdu_len);
+  tv->hdr.type = V9P_TVERSION;
+  put_le16 (&tv->hdr.tag, 0);
+  put_le32 (&tv->msize, 16u << 20);
+  put_le16 (&tv->version_len, 8);
+  memcpy (tv->version, "9P2000.L", 8);
+  return pdu_len;
+}
+
+/* Check that REPLY holds an Rversion of RLEN bytes for 9P2000.L, and
+   return its msize in *MSIZE.  */
+static error_t
+get_rversion (const uint8_t *reply, uint32_t rlen, uint32_t *msize)
+{
+  const struct v9p_version *rv = (const struct v9p_version *) reply;
+  uint32_t vlen;
+
+  if (rlen < sizeof (struct v9p_version) || get_le32 (&rv->hdr.size) != rlen
+      || rv->hdr.type != V9P_RVERSION || get_le16 (&rv->hdr.tag) != 0)
+    {
+      fprintf (stderr, "virtio-9p selftest: malformed Rversion "
+               "(len %u type %u tag %u)\n",
+               rlen, rlen > 4 ? rv->hdr.type : 0,
+               rlen > 5 ? get_le16 (&rv->hdr.tag) : 0);
+      return EIO;
+    }
+  vlen = get_le16 (&rv->version_len);
+  if (rlen < sizeof (struct v9p_version) + vlen || vlen != 8
+      || memcmp (rv->version, "9P2000.L", 8) != 0)
+    {
+      fprintf (stderr, "virtio-9p selftest: bad Rversion version string\n");
+      return EIO;
+    }
+  *msize = get_le32 (&rv->msize);
+  return 0;
+}
+
+/* The selftest asks for 16 MiB twice.  The first Tversion goes out as
+   written and reads what the device offers: QEMU 11.1 answers with its
+   own cap, QEMU 10.x and earlier with the 16 MiB.  The second goes
+   through the stream adapter, which lowers it to V9P_MSIZE_MAX, so its
+   answer must be the smaller of the device's offer and that.  */
 error_t
 v9p_selftest (const char *required_tag)
 {
   uint8_t pdu[32], reply[128];
-  uint32_t pdu_len, rlen, rmsize, vlen;
+  const struct v9p_version *rv = (const struct v9p_version *) reply;
+  uint32_t pdu_len, rlen, device_msize, msize, expect;
   error_t err;
 
-  pdu_len = 4 + 1 + 2 + 4 + 2 + 8;
-  put_le32 (pdu + 0, pdu_len);
-  pdu[4] = 100; /* Tversion */
-  put_le16 (pdu + 5, 0);
-  put_le32 (pdu + 7, 16u << 20);
-  put_le16 (pdu + 11, 8);
-  memcpy (pdu + 13, "9P2000.L", 8);
-
+  pdu_len = put_tversion (pdu);
   err = v9p_exchange (pdu, pdu_len, reply, sizeof reply, &rlen);
   if (err)
     {
@@ -535,17 +632,9 @@ v9p_selftest (const char *required_tag)
                strerror (err));
       return err;
     }
-
-  if (rlen < 7 + 4 + 2 || get_le32 (reply + 0) != rlen
-      || reply[4] != 101 || get_le16 (reply + 5) != 0)
-    {
-      fprintf (stderr, "virtio-9p selftest: malformed Rversion "
-               "(len %u type %u tag %u)\n",
-               rlen, rlen > 4 ? reply[4] : 0, rlen > 5 ? get_le16 (reply + 5) : 0);
-      return EIO;
-    }
-  rmsize = get_le32 (reply + 7);
-  vlen = get_le16 (reply + 11);
+  err = get_rversion (reply, rlen, &device_msize);
+  if (err)
+    return err;
 
   if (strcmp (required_tag, v9p_tag) != 0)
     {
@@ -578,21 +667,32 @@ v9p_selftest (const char *required_tag)
             (unsigned long long) v9p_vring_phys);
   }
 
-  if (rmsize != V9P_MSIZE_CAP)
+  put_tversion (pdu);
+  err = adapter_exchange (pdu, pdu_len, reply, sizeof reply, &rlen);
+  if (err)
     {
-      fprintf (stderr, "virtio-9p selftest: negotiated msize %u, expected "
-               "%u (transport cap)\n", rmsize, V9P_MSIZE_CAP);
-      return EIO;
+      fprintf (stderr, "virtio-9p selftest: Tversion through the stream "
+               "adapter: %s\n", strerror (err));
+      return err;
     }
-  if (vlen != 8 || memcmp (reply + 13, "9P2000.L", 8) != 0)
+  err = get_rversion (reply, rlen, &msize);
+  if (err)
+    return err;
+
+  expect = device_msize < V9P_MSIZE_MAX ? device_msize : V9P_MSIZE_MAX;
+  if (msize != expect)
     {
-      fprintf (stderr, "virtio-9p selftest: bad Rversion version string\n");
+      fprintf (stderr, "virtio-9p selftest: msize %u through the stream "
+               "adapter, expected %u, the smaller of the device's %u and "
+               "the buffer size %u\n",
+               msize, expect, device_msize, V9P_MSIZE_MAX);
       return EIO;
     }
 
   printf ("mount tag feature negotiated\n");
   printf ("Rversion ok\n");
-  printf ("msize=%u\n", rmsize);
-  printf ("version=%.*s\n", (int) vlen, reply + 13);
+  printf ("device msize=%u\n", device_msize);
+  printf ("msize=%u\n", msize);
+  printf ("version=%.*s\n", 8, rv->version);
   return 0;
 }

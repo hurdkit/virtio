@@ -7,6 +7,11 @@
    as soon as any reply byte is available (short reads are mandatory,
    never wait for a full buffer).
 
+   The message size is agreed here as well.  9pfs asks for 16 MiB in its
+   Tversion and sizes every later message to the answer, so a Tversion
+   goes through v9p_clamp_tversion before it is posted and the device
+   answers with a size the request buffers carry.
+
    Many requests are in flight at once.  A complete PDU is posted to the
    device and the write returns without waiting for its reply, so the
    next request from another thread goes straight out.  Completions are
@@ -79,6 +84,8 @@ v9p_ios_write (const void *buf, size_t len)
         }
       if (acc_len - acc_off < size)
         break;
+
+      v9p_clamp_tversion (acc + acc_off, size);
 
       err = v9p_submit (acc + acc_off, size);
       if (err)

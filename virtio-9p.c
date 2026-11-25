@@ -33,6 +33,7 @@ const char *argp_program_version = "virtio-9p 0.1";
 static const char *opt_device;
 static const char *opt_mount_tag = V9P_DEFAULT_MOUNT_TAG;
 static int opt_selftest;
+int v9p_verbose;
 
 static const struct argp_option options[] =
 {
@@ -42,6 +43,8 @@ static const struct argp_option options[] =
    "Require the device's mount tag to be NAME (default hostshare)"},
   {"selftest", 's', 0, 0,
    "Run the Phase 1 device selftest and exit"},
+  {"verbose", 'v', 0, 0,
+   "Print notable events, such as a Tversion msize the buffers lowered"},
   {0}
 };
 
@@ -55,6 +58,9 @@ parse_opt (int key, char *arg, struct argp_state *state)
       break;
     case 't':
       opt_mount_tag = arg;
+      break;
+    case 'v':
+      v9p_verbose = 1;
       break;
     case 's':
       opt_selftest = 1;
