@@ -71,10 +71,12 @@ static const struct argp_option options[] =
    "With --serve: only accept device_open for this name (default: accept "
    "any, including the \"eth\" name pfinet opens with)"},
   {"event-idx", OPT_EVENT_IDX, 0, 0,
-   "Enable split-ring EVENT_IDX used-notification moderation on RX "
-   "(budgeted polling with race-safe interrupt rearming; on by default)"},
+   "Negotiate split-ring EVENT_IDX. The RX loop polls in budgeted passes "
+   "with race-free interrupt rearming, and a --sync writer arms the TX "
+   "queue before it waits. On by default"},
   {"no-event-idx", OPT_NO_EVENT_IDX, 0, 0,
-   "Disable RX EVENT_IDX moderation (legacy one-interrupt-per-packet path)"},
+   "Do not negotiate EVENT_IDX. Every completion on both queues "
+   "interrupts, the legacy path"},
   {"sync", 'S', 0, 0,
    "Wait for each transmitted frame's backend completion (synchronous "
    "TX); default is netdde-style fire-and-forget"},

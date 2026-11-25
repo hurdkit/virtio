@@ -216,11 +216,11 @@ struct vnet_hurd {
 extern int vnet_verbose;
 extern int vnet_tx_sync;
 
-/* RX used-notification moderation policy (--event-idx): when set, the
-   driver also accepts the split-ring EVENT_IDX feature and runs the RX
-   loop in budgeted-polling mode with race-safe interrupt rearming.
-   Default off until the feature is validated against the target
-   device.  */
+/* Used-notification policy, set by --event-idx: when set, the driver
+   accepts the split-ring EVENT_IDX feature.  The RX loop then runs in
+   budgeted-polling mode with race-free interrupt rearming, and the TX
+   queue interrupts only a --sync writer, through the arm that writer
+   publishes before its wait.  On by default.  */
 extern int vnet_event_idx;
 
 /* virtio-net.c */

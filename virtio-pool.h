@@ -105,12 +105,16 @@ void virtio_pool_arm_wait (struct virtio_slot_pool *p, uint16_t slot);
 void virtio_pool_disarm_wait (struct virtio_slot_pool *p, uint16_t slot);
 
 /* Wait for an already-armed SLOT's completion (opportunistic reap).
-   Same contract as virtio_pool_wait_slot.  A completion consumed by
-   another thread's reap is still delivered through the stored result,
-   but the wakeup may then be missed (the IRQ handler narrows wakeups
-   by the queue's used index, which the reaper already advanced), in
-   which case the wait ends at its timeout or the next completion
-   interrupt on the queue.  */
+   Same contract as virtio_pool_wait_slot.  Each pass drains the queue
+   first, and the sleep that follows is armed: the consumed position
+   goes out as the used-event threshold and the used index is rechecked
+   under the queue lock, so on a queue with EVENT_IDX the completion
+   that ends the wait raises the interrupt that wakes it.  A completion
+   consumed by another thread's reap is still delivered through the
+   stored result, but the wakeup may then be missed (the IRQ handler
+   narrows wakeups by the queue's used index, which the reaper already
+   advanced), in which case the wait ends at its timeout or the next
+   completion interrupt on the queue.  */
 error_t virtio_pool_wait_armed (struct virtio_slot_pool *p,
                                 struct virtio_queue *q, uint16_t slot,
                                 int timeout_sec,

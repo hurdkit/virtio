@@ -52,8 +52,9 @@ vnet_dev_bring_up (struct vnet_dev *d, const char *override)
   d->accepted = d->offered & VNET_FEATURES;
   /* Opt-in RX moderation: EVENT_IDX is a transport-wide feature, so
      accepting it switches every queue of this device to threshold-based
-     notifications; both queues are enabled below to preserve their
-     wakeup behavior, and only the RX loop then moderates.  */
+     notifications.  Both queues are enabled below: the RX loop
+     moderates, and the TX queue's only sleeper arms it before
+     waiting.  */
   if (vnet_event_idx)
     d->accepted |= d->offered & (1u << VIRTIO_RING_F_EVENT_IDX);
   virtio_pci_set_guest_features (&d->pci, d->accepted);
@@ -71,10 +72,13 @@ vnet_dev_bring_up (struct vnet_dev *d, const char *override)
   if (err)
     return err;
 
-  /* Arm both queues before anything can complete: the RX queue starts
-     in the legacy-equivalent always-notify state until the RX thread's
-     moderation cycle takes over, and the TX queue keeps it permanently
-     (its waiters rely on per-completion interrupts).  Single-threaded
+  /* Start both queues armed at the consumed position, so the next
+     completion on each interrupts.  The RX thread then runs its own
+     moderation cycle.  The default TX path reaps inline on every
+     submission and never sleeps, so the TX queue stays quiet after
+     that first completion apart from the interrupt QEMU forces each
+     32768 completions, and a --sync writer arms the queue itself
+     before it waits, in virtio_pool_wait_armed.  Single-threaded
      here: the RX thread that reads event_idx_enabled starts later.  */
   virtio_queue_set_event_idx (&d->rxq,
                               (d->accepted
@@ -236,13 +240,9 @@ vnet_tx_submit (struct vnet_dev *d, const void *frame, size_t len,
   if (arm_wait)
     virtio_pool_arm_wait (&d->txpool, *slot_idx);
 
-  /* Under EVENT_IDX the device notifies only while its last-notified
-     index is at or below the published threshold, so every submission
-     refreshes the far-ahead threshold: without this, notifications
-     would stop once the device passed the value published at init and
-     every TX wait would fall back to its one-second timeout.  */
-  virtio_queue_used_notify_always (&d->txq);
-
+  /* No threshold publish here.  The reap above collects what has
+     landed, and a writer that waits arms the queue itself before it
+     sleeps, in virtio_pool_wait_armed.  */
   err = virtio_pool_submit (&d->txpool, &d->txq, *slot_idx, &buf, 1, NULL);
   if (err && arm_wait)
     virtio_pool_disarm_wait (&d->txpool, *slot_idx);

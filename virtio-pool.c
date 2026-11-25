@@ -284,6 +284,7 @@ virtio_pool_wait_armed (struct virtio_slot_pool *p, struct virtio_queue *q,
   struct timespec deadline;
   int werr;
   uint32_t observed_seq;
+  uint16_t token;
 
   clock_gettime (CLOCK_REALTIME, &deadline);
   deadline.tv_sec += timeout_sec;
@@ -301,7 +302,22 @@ virtio_pool_wait_armed (struct virtio_slot_pool *p, struct virtio_queue *q,
       if (werr != EAGAIN)
         return werr;
 
+      /* Sleep only armed.  The drain above left the ring empty, so
+         publishing the consumed position makes the next completion
+         interrupt.  Without that arm the threshold in place was
+         already passed and nothing under EVENT_IDX wakes this waiter.
+         The recheck runs under the queue lock, the one the IRQ handler
+         broadcasts under: a completion that lands between the arm and
+         the wait is either seen by the recheck or signals the condvar
+         once the wait has begun.  Without the recheck a wakeup that
+         arrives between the drain and the wait is lost to it.  */
+      token = virtio_queue_enable_used_cb_prepare (q);
       pthread_mutex_lock (&q->lock);
+      if (virtio_queue_poll_used (q, token))
+        {
+          pthread_mutex_unlock (&q->lock);
+          continue;
+        }
       werr = pthread_cond_timedwait (&q->cv, &q->lock, &deadline);
       pthread_mutex_unlock (&q->lock);
       if (werr != 0)

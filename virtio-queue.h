@@ -6,9 +6,10 @@
    Each queue's vring lives in one physically contiguous, page-granular
    region (the legacy QUEUE_PFN register addresses the whole ring by page
    number, so the allocation must be page aligned), and completions are
-   signalled per queue: the IRQ handler broadcasts every queue's condvar
-   and a separate config-change condvar, and waiters re-check the used
-   index instead of trusting the wakeup, the way virtio-9p always has.
+   signalled per queue: the IRQ handler broadcasts the condvar of every
+   queue that has unconsumed completions, plus a separate config-change
+   condvar, and waiters re-check the used index instead of trusting the
+   wakeup, the way virtio-9p always has.
 
    Descriptors come from a free list, so any number of chains may be in
    flight.  virtio-9p keeps many requests in flight and consumes their
@@ -144,8 +145,8 @@ error_t virtio_queue_try_pop_used (struct virtio_queue *,
    position yields exactly one interrupt for the next completion, and
    sleeping on the queue condvar is safe only after that publish, a
    barrier, and a recheck of the used index.  The arm/suppress/wait trio
-   and the poll belong to the queue's completion-consumer thread;
-   used_notify_always is for submitter threads; set_event_idx runs once
+   and the poll belong to the queue's completion-consumer thread, and a
+   thread that sleeps arms after its own drain. set_event_idx runs once
    at init, before any consumer or submitter exists.
 
    With event_idx_enabled clear they are no-ops or legacy-equivalent:
@@ -153,19 +154,15 @@ error_t virtio_queue_try_pop_used (struct virtio_queue *,
    (avail flags stay zero), which is the behavior every driver had
    before this API existed.  */
 
-/* Enable moderation on this queue; only valid once EVENT_IDX was
+/* Enable moderation on this queue. Only valid once EVENT_IDX was
    negotiated device-wide and before the consumer thread starts.
-   Publishes a far-ahead threshold so every completion interrupts (the
-   legacy always-notify behavior) until the consumer's
-   disable/prepare cycle takes over.  */
+   Publishes the consumed position as the threshold, so the next
+   completion interrupts. No threshold keeps a queue interrupting per
+   completion under EVENT_IDX: after that interrupt the queue stays
+   quiet until a thread arms it again, apart from one forced interrupt
+   each 32768 completions. A sleeper arms before every wait, and a
+   queue that is only polled inline never needs the interrupt.  */
 void virtio_queue_set_event_idx (struct virtio_queue *, int enabled);
-
-/* Keep per-completion interrupts flowing on a posting queue: refresh
-   the far-ahead threshold.  Must be re-run before the device can
-   advance half the 16-bit index space past the published value, which
-   cannot happen while fewer than VIRTIO_QUEUE_MAX buffers are ever in
-   flight, but a long-lived queue republishes per submission anyway.  */
-void virtio_queue_used_notify_always (struct virtio_queue *);
 
 /* Quiet the device while the consumer polls (budgeted drain).  At most
    one more interrupt can arrive afterwards; any imperfection only

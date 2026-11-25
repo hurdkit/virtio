@@ -335,23 +335,39 @@ virtio_queue_try_pop_used (struct virtio_queue *q,
 }
 
 /* Split EVENT_IDX used-notification moderation.  The device-side rule
-   (QEMU virtio_split_should_notify) is: at every completion the device
-   compares the used index it recorded at its previous completion check
-   against the published used_event threshold, interrupts when that
-   recorded index is at or below the threshold, and then records the
-   current used index whether or not it interrupts.  At a quiet queue
-   the recorded index equals the used index, so a threshold at the
-   consumed position (arm) interrupts for the next completion and then
-   goes quiet, and a threshold one below the current used index
-   (suppress) is already passed and stays quiet.  The recorded index
-   never exceeds the used index, which is what makes the
+   is vring_need_event from the uapi header QEMU imports,
+   standard-headers/linux/virtio_ring.h:
+
+       return (uint16_t)(new_idx - event_idx - 1) < (uint16_t)(new_idx - old);
+
+   old is the used index the device recorded at its previous
+   completion, new_idx the used index now, and event_idx the threshold
+   published here.  QEMU records the used index at every completion,
+   whether or not it interrupts, so old never exceeds new_idx.  The
+   test holds exactly when old is at or below event_idx and event_idx
+   is below new_idx: the threshold has to lie between the two, so the
+   used index has to move past it before anything interrupts.  Right
+   after the device reset there is no recorded index, and that first
+   completion interrupts whatever the threshold says.  QEMU also drops
+   the recorded index once the used index runs 32768 or more past it,
+   so a queue nobody arms takes one interrupt each 32768 completions.
+
+   At a quiet queue the recorded index equals the used index, so a
+   threshold at the consumed position (arm) interrupts for the next
+   completion and then goes quiet, and a threshold one below the current
+   used index (suppress) is already passed and stays quiet.  A threshold
+   published ahead of the used index stays quiet until the used index
+   passes it, so no one published value makes a queue interrupt on
+   every completion: the threshold has to follow consumption.  The
+   recorded index never exceeds the used index, which is what makes the
    arm-at-last_used value safe: at an idle, fully drained queue the
    next push always satisfies the test.
 
    Every publish is a full barrier (virtio_wmb), so the store is ordered
    before the caller's recheck load of used_idx: a completion that raced
-   the publish cannot deliver an interrupt, but it is observed by the
-   recheck, which is why sleeping without the recheck is forbidden.  */
+   the publish was decided under the previous threshold and may or may
+   not interrupt, but it is observed by the recheck, which is why
+   sleeping without the recheck is forbidden.  */
 static void
 virtio_queue_publish_used_event (struct virtio_queue *q, uint16_t threshold)
 {
@@ -363,26 +379,13 @@ void
 virtio_queue_set_event_idx (struct virtio_queue *q, int enabled)
 {
   q->event_idx_enabled = !!enabled;
+  /* Start armed at the consumed position, so the next completion
+     interrupts.  After it the queue is quiet until a thread arms it
+     again, apart from the interrupt QEMU forces each 32768
+     completions.  A sleeper arms before every wait, and a queue that
+     is only polled inline never needs the interrupt.  */
   if (q->event_idx_enabled)
-    /* Legacy-equivalent baseline: every completion interrupts until the
-       consumer's disable/prepare cycle takes over.  This also covers a
-       device-wide EVENT_IDX negotiation for queues that never poll, so
-       their waiters keep the pre-EVENT_IDX wakeup behavior.  */
-    virtio_queue_used_notify_always (q);
-}
-
-void
-virtio_queue_used_notify_always (struct virtio_queue *q)
-{
-  if (!q->event_idx_enabled)
-    return;
-  /* Half the 16-bit index space ahead of the used index: the device
-     cannot satisfy the notify test until it laps the threshold, and
-     with at most VIRTIO_QUEUE_MAX buffers ever in flight it cannot
-     advance that far while the driver keeps consuming.  */
-  pthread_mutex_lock (&q->lock);
-  virtio_queue_publish_used_event (q, (uint16_t) (*q->used_idx + 0x7fff));
-  pthread_mutex_unlock (&q->lock);
+    virtio_queue_enable_used_cb_prepare (q);
 }
 
 void
