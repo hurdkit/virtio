@@ -69,8 +69,14 @@ MIGCOMFLAGS =
 # MIGCOM) must not be given to this one: unknown switches are forwarded
 # to the preprocessor.
 
+# The compile command of the pattern rule and the link flags of the
+# virtio-9p rule, written once: virtio-9p-verify rebuilds the driver
+# from the same commands, and a flag added here reaches both.
+COMPILE = $(CC) $(CFLAGS) -D_GNU_SOURCE -c
+LINK9P = -pthread $(foreach LIB,$(LIBS),-l$(LIB))
+
 virtio-9p: $(OBJS9P)
-	$(CC) $(CFLAGS) $^ -o $@ -pthread $(foreach LIB,$(LIBS),-l$(LIB))
+	$(CC) $(CFLAGS) $^ -o $@ $(LINK9P)
 
 virtio-balloon: $(OBJSBAL)
 	$(CC) $(CFLAGS) $^ -o $@ -pthread $(foreach LIB,$(LIBS_DAEMON),-l$(LIB))
@@ -138,7 +144,7 @@ vnetNotifyServer.c vnet-notify_S.h: vnet-notify.sdefsi
 # Every object depends on every header of the drivers, so that a new
 # header cannot be left out of this rule.  None of them is generated.
 %.o: %.c $(wildcard virtio*.h)
-	$(CC) $(CFLAGS) -D_GNU_SOURCE -c $< -o $@
+	$(COMPILE) $< -o $@
 
 # The MIG stubs include "vnet-device_S.h"/"vnet-notify_S.h" (generated
 # here) and libports/ports.h + libports/mig-decls.h (not installed in
@@ -202,4 +208,50 @@ clean:
 	    vnet-device_S.h vnet-notify.sdefsi* vnetNotifyServer.c \
 	    vnet-notify_S.h
 
-.PHONY: clean all check-hurd-src
+# virtio-9p-verify fails unless VIRTIO_9P_BIN is the build of the sources
+# in this tree.  The bench harness stages a virtio-9p that sits beside
+# its sources.  When #28 merged nothing rebuilt that binary, so every
+# 9pfs 4K figure had run on the transport before #28, see
+# hurdkit/virtio#29.
+#
+# The reference is compiled from the working tree into a scratch
+# directory, with the commands and the link order of the real build.
+# The tree's own objects are never reused, since the build products in
+# this directory are what is in doubt.  Both files are compared with the
+# debug info stripped: -g records the build directory and the line
+# numbers, so one commit built in two checkouts gives two files with one
+# code.  The build-id note goes too, since it hashes the debug info on
+# a toolchain that emits one.  The md5 of each whole file is printed for
+# the record, and the stripped md5 decides.
+VIRTIO_9P_BIN ?= virtio-9p
+OBJCOPY ?= objcopy
+virtio-9p-verify:
+	@set -e; \
+	bin='$(VIRTIO_9P_BIN)'; \
+	test -f "$$bin" || { \
+	    echo "virtio: virtio-9p-verify: no binary at $$bin" >&2; exit 1; }; \
+	ref=`mktemp -d`; trap 'rm -rf "$$ref"' EXIT; \
+	for o in $(OBJS9P); do $(COMPILE) $${o%.o}.c -o "$$ref/$$o"; done; \
+	$(CC) $(CFLAGS) $(foreach o,$(OBJS9P),"$$ref/$(o)") -o "$$ref/virtio-9p" \
+	    $(LINK9P); \
+	$(OBJCOPY) --strip-debug --remove-section=.note.gnu.build-id \
+	    "$$bin" "$$ref/staged"; \
+	$(OBJCOPY) --strip-debug --remove-section=.note.gnu.build-id \
+	    "$$ref/virtio-9p" "$$ref/rebuilt"; \
+	md5() { h=`md5sum < "$$1"` || return 1; printf '%s\n' "$${h%% *}"; }; \
+	have=`md5 "$$bin"`; want=`md5 "$$ref/virtio-9p"`; \
+	have_code=`md5 "$$ref/staged"`; want_code=`md5 "$$ref/rebuilt"`; \
+	if test "$$have_code" != "$$want_code"; then \
+	    echo "virtio: FAIL: $$bin is not the build of the sources in this tree" >&2; \
+	    echo "virtio:   binary     md5 $$have, without debug info $$have_code" >&2; \
+	    echo "virtio:   this tree  md5 $$want, without debug info $$want_code" >&2; \
+	    echo "virtio:   reference built with CC=$(CC) CFLAGS=$(CFLAGS)" >&2; \
+	    echo "virtio:   rebuild it from the hurdkit checkout:" \
+	        "make -C toolchain virtio-9p VIRTIO_DIR=$$PWD" >&2; \
+	    exit 1; \
+	fi; \
+	echo "virtio: PASS: $$bin is the build of the sources in this tree"; \
+	echo "virtio:   binary     md5 $$have, without debug info $$have_code"; \
+	echo "virtio:   this tree  md5 $$want, without debug info $$want_code"
+
+.PHONY: clean all check-hurd-src virtio-9p-verify

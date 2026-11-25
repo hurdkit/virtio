@@ -77,8 +77,24 @@ make virtio-balloon      # balloon driver only
 make virtio-blk          # block driver only
 make virtio-net          # network driver only
 make vblk-client         # direct Mach device RPC client only
+make virtio-9p-verify    # fail unless a virtio-9p binary is the build of
+                         # the sources in this tree, see below
 make CFLAGS=-g           # debugging build
 ```
+
+`make virtio-9p-verify` fails unless a virtio-9p binary is the build of the
+sources in this tree, which is the binary the bench harness stages.
+
+- It compiles the translator from the working tree into a scratch
+  directory, with the commands and flags of `make virtio-9p`.
+- `VIRTIO_9P_BIN=path` names the binary to check. The default is
+  `./virtio-9p`.
+- Both files are compared with the debug info stripped. `-g` records the
+  build directory, so one commit built in two checkouts gives two files
+  with one code.
+- It prints the md5 of each whole file and fails when the stripped md5s
+  differ.
+- Run it with the same `CC`, `CFLAGS`, `CPATH` and `LIBS` as the build.
 
 ## virtio-9p usage
 
